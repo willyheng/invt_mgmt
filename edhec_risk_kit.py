@@ -38,6 +38,44 @@ def get_ind_returns():
     
     return ind
 
+def get_ind_nfirms():
+    """
+    Get industry number of firms
+    """
+    ind = pd.read_csv("data/ind30_m_nfirms.csv", header=0, index_col=0, parse_dates=True)
+    ind.index = pd.to_datetime(ind.index,format="%Y%m").to_period("M")
+    ind.columns = ind.columns.str.strip()
+    
+    return ind
+
+def get_ind_size():
+    """
+    Get industry size 
+    """
+    ind = pd.read_csv("data/ind30_m_size.csv", header=0, index_col=0, parse_dates=True)
+    ind.index = pd.to_datetime(ind.index,format="%Y%m").to_period("M")
+    ind.columns = ind.columns.str.strip()
+    
+    return ind
+
+def get_total_market_index_returns():
+    """
+    Get and calculate the total market index returns
+    """
+    ind_ret = get_ind_returns()
+    ind_nfirms = get_ind_nfirms()
+    ind_size = get_ind_size()
+    
+    ind_mktcap = ind_nfirms * ind_size
+    total_mktcap = ind_mktcap.sum(axis="columns")
+    ind_capweight = ind_mktcap.divide(total_mktcap, axis="rows")
+    ind_capweight["1926"].sum(axis="columns")
+    
+    total_mkt_ret = (ind_capweight*ind_ret).sum(axis="columns")
+    
+    return total_mkt_ret
+    
+
 ###############################
 ###     CALCULATIONS     ######
 ###############################
@@ -100,7 +138,25 @@ def var_gaussian(r, level=5, modified=False):
 
     return -(r.mean() + z * r.std(ddof=0))
 
+def cvar_historic(r, level=5, modified=False):
+    """
+    CVar historic
+    """
+    return r[r < r.quantile(level/100)].mean()
 
+def summary_stats(r, riskfree_rate=0.03):
+    """
+    Return a DataFrame with aggregated summary of returns
+    """
+    return pd.DataFrame({
+        "Annualized Return": r.aggregate(annualized_ret, periods_per_year=12),
+        "Annualized Vol": r.aggregate(annualized_vol, periods_per_year=12),
+        "Skewness": r.skew(),
+        "Kurtosis": r.kurtosis(),
+        "Cornish-Fisher VaR (5%)": r.aggregate(var_gaussian, modified=True),
+        "Historic CVaR": r.aggregate(cvar_historic),
+        "Max Drawdown": r.aggregate(lambda ret: drawdown(ret).Drawdown.min())
+    })
 
 ################################
 ###### Efficient Frontier ######
@@ -215,3 +271,78 @@ def plot_ef(n_points, er, cov, show_cml=False, style=".-", riskfree_rate=0, show
         ax.plot(cml_x, cml_y, color="green", marker="o", markersize=10, linestyle="dashed")
     
     return ax
+
+##################################
+######       CPPI.       #########
+##################################
+def run_cppi(risky_r, safe_r=None, m=3, start=1000, floor=0.8, riskfree_rate=0.03, drawdown=None):
+    """
+    Run a backtest of the CPPI strategy
+    Returns a dictionary of: Asset Value history, Risk budget history, risky weight history
+    """
+    dates = risky_r.index
+    n_steps = len(dates)
+    account_value = start
+    floor_value = start*floor
+    peak = start
+    
+    if isinstance(risky_r, pd.Series):
+        risky_r = pd.DataFrame(risky_r, columns=["R"])
+    
+    if safe_r is None:
+        safe_r = pd.DataFrame().reindex_like(risky_r)
+        safe_r.values[:] = riskfree_rate/12
+
+    account_history = pd.DataFrame().reindex_like(risky_r)
+    cushion_history = pd.DataFrame().reindex_like(risky_r)
+    risky_w_history = pd.DataFrame().reindex_like(risky_r)
+    
+    for step in range(n_steps):
+        if drawdown is not None:
+            peak = np.maximum(peak, account_value)
+            floor_value = peak*(1-drawdown)
+        cushion = (account_value - floor_value) / account_value
+        risky_w = np.maximum(np.minimum(m * cushion, 1),0)
+        safe_w = 1 - risky_w
+        risky_alloc = account_value * risky_w
+        safe_alloc = account_value * safe_w
+
+        ## Update the account value for this time step
+        account_value = risky_alloc*(1+risky_r.iloc[step]) + safe_alloc*(1+safe_r.iloc[step])
+
+        # save the values to look up history and plot
+        cushion_history.iloc[step] = cushion
+        risky_w_history.iloc[step] = risky_w
+        account_history.iloc[step] = account_value
+        
+    risky_wealth = start * (1+risky_r).cumprod()
+    backtest_result = {
+        "Wealth": account_history,
+        "Risky Wealth": risky_wealth,
+        "Risk Budget": cushion_history,
+        "Risky Allocation": risky_w_history,
+        "m": m,
+        "start": start,
+        "floor": floor,
+        "risky_r": risky_r,
+        "safe_r": safe_r
+    }
+    
+    return backtest_result
+
+################################
+########   GBM.   ##############
+################################
+
+def gbm(n_years=10, n_scenarios=1000, mu=0.07, sigma=0.15, prices=True, steps_per_year=12, s_0=100.0):
+    """
+    Evolution of stockprice using Geometric Brownian Motion Model
+    """
+    dt = 1/steps_per_year
+    n_steps = int(n_years * steps_per_year)
+    rets_plus_1 = np.random.normal(loc=1+mu*dt, scale=(sigma*np.sqrt(dt)), size=(n_steps, n_scenarios))
+    rets_plus_1[0] = 1
+    if prices:
+        return s_0*pd.DataFrame(rets_plus_1).cumprod()
+    
+    return rets_plus_1-1
